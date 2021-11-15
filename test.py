@@ -1,4 +1,4 @@
-from EasySocket import ConnectionManager
+from PyEasySocket import ConnectionManager
 from queue import Queue
 import time
 
