@@ -1,14 +1,30 @@
 # %%
 from asyncio.events import AbstractEventLoop
 import concurrent.futures
-import ssl
 import asyncio
-import websockets
+import aiohttp
 from typing import Callable, Any, Dict
-# Extension import necessary to properly communicate to some servers
-import websockets.extensions.permessage_deflate as deflateExt
 
-sharedSSLContext = ssl.create_default_context()
+# _ProactorBasePipeBasePipeTransport error throws on Windows 10.
+# Code below is to silence error.
+# https://github.com/aio-libs/aiohttp/issues/4324
+from functools import wraps
+from asyncio.proactor_events import _ProactorBasePipeTransport
+import platform
+def silence_event_loop_closed(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except RuntimeError as e:
+            if str(e) != 'Event loop is closed':
+                raise
+    return wrapper
+if platform.system() == 'Windows':
+    # Silence the exception here.
+    _ProactorBasePipeTransport.__del__ = silence_event_loop_closed(_ProactorBasePipeTransport.__del__)
+
+
 class EasyAsyncWS:
     """Handle a single websocket connection using coroutines to send/receive.
     To send a message, call .sendingQ.put_nowait method.
@@ -33,7 +49,7 @@ class EasyAsyncWS:
         if startingMessage != "":
             self.sendingQ.put_nowait(startingMessage)
         # Utility list to store associated running coroutines
-        self.tasks = []
+        self.tasks: Dict[str, asyncio.Task] = {}
         self.url = url
         self.closeTimeout = closeTimeout
 
@@ -42,36 +58,41 @@ class EasyAsyncWS:
         
         Reminder: Ensure the event loop its operating on never gets blocked for long.
         (E.g sleep(), input() etc). Otherwise send/receive of the socket will also halt."""
-        self.tasks.append(self.eventLoop.create_task(self.__startupRoutine()))
+        self.tasks["startup"] = self.eventLoop.create_task(self.__startupRoutine())
     
     async def __startupRoutine(self): 
         # Open/close connection
-        async with websockets.connect(
-            self.url, 
-            extensions = [deflateExt.ClientPerMessageDeflateFactory()],
-            close_timeout = self.closeTimeout
-        ) as websocket:
-            # Place __receiveRoutine onto the event loop
-            self.tasks.append(self.eventLoop.create_task(self.__receiveRoutine(websocket)))
-            # __sendRoutine will finish when close() method is called
-            await self.__sendRoutine(websocket)
-    async def __receiveRoutine(self, websocket):
-        # This will automatically exit with an error when websocket has closed
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(self.url) as websocket:
+                # Place __receiveRoutine and __sendRoutine onto the event loop
+                self.tasks["receive"] = self.eventLoop.create_task(self.__receiveRoutine(websocket))
+                self.tasks["send"] = self.eventLoop.create_task(self.__sendRoutine(websocket))
+                # await for both coroutines to finish
+                await self.tasks["send"]
+                await self.tasks["receive"]
+    async def __receiveRoutine(self, websocket: aiohttp.ClientWebSocketResponse):
         async for msg in websocket:
-            self.receiveCallback(msg)
-    async def __sendRoutine(self, websocket):
+            if websocket.closed == True:
+                break
+            # Check for other errors
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                self.receiveCallback(msg.data)
+            else:
+                break
+    async def __sendRoutine(self, websocket: aiohttp.ClientWebSocketResponse):
         while True:
             msg = await self.sendingQ.get()
             if msg == "EXIT": # Check if close() method has been called
+                await websocket.close()
                 break
-            await websocket.send(msg)
+            await websocket.send_str(msg)
 
     async def close(self):
         """Asynchronously close connection and close all coroutines associated
         with this object"""
         # Doing self.sendingQ.put_nowait("EXIT") could be simpler here?
-        self.tasks.append(asyncio.create_task(self.sendingQ.put("EXIT")))
-        await asyncio.gather(*self.tasks)
+        self.tasks["exitput"] = asyncio.create_task(self.sendingQ.put("EXIT"))
+        await asyncio.gather(*self.tasks.values())
 
 class ConnectionManager:
     """Manages the creation/deletion of EasyAsyncWS websockets in
@@ -125,7 +146,7 @@ class ConnectionManager:
             closure = asyncio.run_coroutine_threadsafe(connection.close(), self.eventLoop)
             futureCloses.append(closure)
         # Block until sockets are closed
-        concurrent.futures.wait(futureCloses)
+        concurrent.futures.wait(futureCloses, return_when=concurrent.futures.ALL_COMPLETED)
         # Close the event loop
         self.eventLoop.call_soon_threadsafe(self.eventLoop.stop)
         # Block till event loop is closed
