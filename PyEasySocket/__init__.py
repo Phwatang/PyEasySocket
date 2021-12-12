@@ -1,1 +1,1 @@
-from .ConnectionManager import EasyAsyncWS, ConnectionManager
+from .ConnectionManager import EasyAsyncWS, EasyAsyncHTTP, ConnectionManager
